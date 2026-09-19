@@ -55,6 +55,17 @@ Timestamps use the container's per-frame values (`CAP_PROP_POS_MSEC`) by
 default, which handles variable frame rate; use `--no-container-timestamps`
 to force `index/fps` timestamps for debugging.
 
+Apple's "HDR Video" capture mode (10-bit HEVC, HLG/Rec.2020) is detected via
+`ffprobe`'s `color_transfer` tag and tone-mapped down to SDR through an
+ffmpeg-subprocess `zscale`/`tonemap` pipeline before any scoring/export --
+`cv2.VideoCapture` has no HDR-aware decode path of its own and reads such
+clips out far too bright otherwise. This forces the ffmpeg-subprocess backend
+(so timestamps become `index/fps` approximations, per above) and requires a
+working `ffmpeg`+`ffprobe` on PATH; if either is missing, extraction falls
+back to the raw (too-bright) OpenCV decode with a logged warning rather than
+failing outright. Whether tone-mapping was applied is recorded in
+`manifest.json` under `video_meta.hdr_tonemapped`.
+
 ## Known limitations
 
 - No auto-exposure/white-balance compensation for iPhone auto-exposure hunting.

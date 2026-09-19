@@ -40,6 +40,26 @@ class VideoInfo:
     rotation_source: RotationSource
     backend: str
     timestamps_source: str = "container"
+    hdr_tonemapped: bool = False
+
+
+# HLG and PQ, the two HDR transfer functions Apple's "HDR Video" capture mode
+# uses (10-bit HEVC, Rec.2020 primaries). cv2's decode path applies no HDR
+# EOTF/tone-mapping at all -- it treats decoded values as plain Rec.709/sRGB
+# -- so frames from clips with either of these read out far too bright/washed
+# out relative to normal SDR playback once reinterpreted that way.
+_HDR_TRANSFER_FUNCTIONS = frozenset({"arib-std-b67", "smpte2084"})
+
+# zscale needs an explicit linear scene-referred step before tonemap, then a
+# conversion back down to a standard 8-bit SDR/Rec.709 target. tonemap needs
+# a float RGB intermediate (gbrpf32le) -- feeding it yuv420p directly forces
+# an implicit, lower-precision conversion -- and desat=0 disables the filter's
+# default highlight desaturation, which otherwise reads as a flat, washed-out,
+# low-contrast image relative to how Apple's own HDR->SDR conversion looks.
+_TONEMAP_FILTER = (
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+)
 
 
 @dataclass
@@ -105,6 +125,41 @@ def _probe_rotation_ffprobe(path: Path) -> Optional[int]:
     # ffprobe ran and parsed fine, it just found no rotation tag/side-data:
     # a successful "no rotation" answer, distinct from ffprobe failing outright.
     return 0
+
+
+def _probe_needs_tonemap(path: Path) -> bool:
+    """True if ffprobe reports an HDR transfer function on the video stream.
+    ffprobe being unavailable/inconclusive is treated as "not HDR" -- same
+    best-effort failure handling as _probe_rotation_ffprobe.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_transfer",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0 or not proc.stdout:
+        return False
+    try:
+        data = json.loads(proc.stdout)
+        transfer = data["streams"][0].get("color_transfer")
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return False
+    return transfer in _HDR_TRANSFER_FUNCTIONS
 
 
 def _probe_rotation_cv2(cap: cv2.VideoCapture) -> int:
@@ -227,15 +282,18 @@ class _OpenCvBackend:
 class _FfmpegBackend:
     """Fallback decoder: pipes raw BGR24 frames from a system ffmpeg process.
 
-    Used only when the installed opencv-python build cannot open/read the
-    input (e.g. HEVC support missing from its bundled ffmpeg). Timestamps here
-    are index/fps, since a raw video pipe does not carry per-frame PTS: this
-    fallback path is approximate and a warning is logged accordingly.
+    Used when the installed opencv-python build cannot open/read the input
+    (e.g. HEVC support missing from its bundled ffmpeg), or when the source
+    is HDR and needs the zscale/tonemap filter chain applied (cv2 has no
+    color-management step of its own). Timestamps here are index/fps, since a
+    raw video pipe does not carry per-frame PTS: this fallback path is
+    approximate and a warning is logged accordingly.
     """
 
-    def __init__(self, path: Path, rotation: int):
+    def __init__(self, path: Path, rotation: int, tonemap: bool = False):
         self._path = path
         self._rotation = rotation
+        self._tonemap = tonemap
         info = self._probe()
         self.fps, self.frame_count, self.width, self.height = info
 
@@ -282,7 +340,18 @@ class _FfmpegBackend:
             "index/fps approximations, not true container timestamps."
         )
         frame_bytes = self.width * self.height * 3
-        cmd = ["ffmpeg", "-v", "error", "-i", str(self._path), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        # -noautorotate: recent ffmpeg builds auto-apply the container's
+        # rotation side data by default, which would both resize the raw
+        # output frames out from under self.width/self.height (probed via
+        # ffprobe, which does NOT auto-rotate) and double up with our own
+        # _apply_rotation() call below -- the exact double-rotation class of
+        # bug already fixed for the OpenCV backend via
+        # CAP_PROP_ORIENTATION_AUTO. Keep rotation as this class's single
+        # responsibility, applied exactly once, after decode.
+        cmd = ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(self._path)]
+        if self._tonemap:
+            cmd += ["-vf", _TONEMAP_FILTER]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
         assert proc.stdout is not None
         try:
@@ -317,8 +386,30 @@ class DecodedVideo:
         probe_cap = cv2_backend.cap if cv2_usable else None
         rotation, rotation_source = _detect_rotation(path, probe_cap, rotation_mode)
 
+        needs_tonemap = _probe_needs_tonemap(path)
+        tonemap_backend: Optional[_FfmpegBackend] = None
+        if needs_tonemap:
+            try:
+                candidate = _FfmpegBackend(path, rotation, tonemap=True)
+            except RuntimeError:
+                candidate = None
+            tonemap_backend = candidate if candidate is not None and candidate.usable() else None
+
         self._backend: _DecodeBackend
-        if cv2_usable:
+        tonemap_applied = False
+        if tonemap_backend is not None:
+            cv2_backend.close()
+            self._backend = tonemap_backend
+            backend_name = "ffmpeg"
+            tonemap_applied = True
+        elif cv2_usable:
+            if needs_tonemap:
+                logger.warning(
+                    "HDR (HLG/PQ) transfer function detected but the ffmpeg "
+                    "tone-mapping fallback is unavailable (ffmpeg/ffprobe missing "
+                    "or failed); frames will read too bright/washed out relative "
+                    "to normal SDR playback. Install ffmpeg to fix this."
+                )
             cv2_backend._rotation = rotation
             self._backend = cv2_backend
             backend_name = "opencv"
@@ -342,9 +433,11 @@ class DecodedVideo:
             rotation_applied=rotation,
             rotation_source=rotation_source,
             backend=backend_name,
+            hdr_tonemapped=tonemap_applied,
         )
         logger.info(
-            "video fps=%.3f size=%dx%d frame_count=%s rotation=%d (%s) backend=%s",
+            "video fps=%.3f size=%dx%d frame_count=%s rotation=%d (%s) backend=%s "
+            "hdr_tonemapped=%s",
             fps,
             width,
             height,
@@ -352,6 +445,7 @@ class DecodedVideo:
             rotation,
             rotation_source,
             backend_name,
+            tonemap_applied,
         )
 
     def iter_analysis_frames(

@@ -33,6 +33,12 @@ def test_iter_export_frames_empty_indices_yields_nothing(synthetic_video):
         assert list(dv.iter_export_frames([])) == []
 
 
+def test_sdr_synthetic_video_is_not_tonemapped(synthetic_video):
+    with decode.open_video(synthetic_video) as dv:
+        assert dv.info.hdr_tonemapped is False
+        assert dv.info.backend == "opencv"  # tonemap detection shouldn't force the ffmpeg path
+
+
 # The seek-lands-inaccurately fallback branch in iter_export_frames is not
 # covered here: cv2.VideoCapture's get()/set() are read-only C-extension
 # attributes (no monkeypatching), and this project's mp4v synthetic fixture

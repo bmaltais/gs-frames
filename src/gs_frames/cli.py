@@ -152,6 +152,7 @@ def _write_manifest(
             "frame_count": video_info.frame_count,
             "rotation_applied": video_info.rotation_applied,
             "rotation_source": video_info.rotation_source,
+            "hdr_tonemapped": video_info.hdr_tonemapped,
         },
         "config": config_dict,
         "stats": {
