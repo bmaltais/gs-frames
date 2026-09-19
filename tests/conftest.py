@@ -36,11 +36,26 @@ def synthetic_video(tmp_path) -> Path:
 
 @pytest.fixture
 def iphone_fixture() -> Path:
-    path = Path(__file__).parent / "fixtures" / "iphone_sample_portrait_hevc.mov"
-    if not path.exists():
-        pytest.skip(
-            "tests/fixtures/iphone_sample_portrait_hevc.mov not present in this checkout; "
-            "8a rotation/HEVC/VFR handling is implemented in decode.py but cannot be exercised "
-            "against real iPhone footage without committing a real fixture (size/licensing)."
-        )
-    return path
+    """A real iPhone-recorded clip to exercise 8a (rotation/HEVC/VFR) against.
+
+    Checked in two places: the committable `tests/fixtures/` path, and the
+    gitignored `videos/` dev folder (real footage kept local-only, not
+    committed -- see .gitignore). Neither is required; the test skips with a
+    clear reason if no real clip is present in this checkout.
+    """
+    committed = Path(__file__).parent / "fixtures" / "iphone_sample_portrait_hevc.mov"
+    if committed.exists():
+        return committed
+
+    local_dir = Path(__file__).parent.parent / "videos"
+    if local_dir.is_dir():
+        for ext in ("*.mov", "*.MOV", "*.mp4", "*.MP4"):
+            matches = sorted(local_dir.glob(ext))
+            if matches:
+                return matches[0]
+
+    pytest.skip(
+        "no real iPhone clip found (checked tests/fixtures/iphone_sample_portrait_hevc.mov "
+        "and videos/*.mov); 8a rotation/HEVC/VFR handling is implemented in decode.py but "
+        "cannot be exercised against real iPhone footage without one."
+    )

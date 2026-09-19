@@ -156,6 +156,12 @@ class _OpenCvBackend:
         self._rotation = rotation
         self._use_container_timestamps = use_container_timestamps
         self.cap = cv2.VideoCapture(str(path))
+        # Some OpenCV/FFmpeg builds auto-apply container rotation metadata to
+        # decoded frames themselves (and to FRAME_WIDTH/HEIGHT); others don't.
+        # Disabling this explicitly makes rotation handling deterministic
+        # across builds -- we always get raw frames here and apply the
+        # rotation ourselves exactly once in _apply_rotation.
+        self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
 
     def usable(self) -> bool:
         if not self.cap.isOpened():

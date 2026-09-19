@@ -10,7 +10,16 @@ import numpy as np
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.progress import Progress
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from gs_frames import __version__
 from gs_frames import decode, sharpness
@@ -29,6 +38,31 @@ def _parse_overlap(overlap: str) -> tuple[float, float]:
     if lo > 1 or hi > 1:
         lo, hi = lo / 100, hi / 100
     return lo, hi
+
+
+def _estimate_analysis_frame_count(
+    config: ExtractConfig, video_info: decode.VideoInfo
+) -> Optional[int]:
+    """Best-effort frame count for the progress bar's total, honoring
+    --start/--end bounds so a trimmed run doesn't show progress/ETA against
+    the full video's frame count. Approximate under VFR (uses nominal fps);
+    display-only, never used for selection logic.
+    """
+    start_frame = config.start_frame or 0
+    if config.start_s is not None and video_info.fps:
+        start_frame = max(start_frame, round(config.start_s * video_info.fps))
+
+    end_frame: Optional[int]
+    if config.end_frame is not None:
+        end_frame = config.end_frame
+    elif config.end_s is not None and video_info.fps:
+        end_frame = round(config.end_s * video_info.fps)
+    else:
+        end_frame = video_info.frame_count
+
+    if end_frame is None:
+        return None
+    return max(0, end_frame - start_frame)
 
 
 def _setup_logging(log_path: Path) -> None:
@@ -166,8 +200,19 @@ def extract(
             laplacian_vals: list[float] = []
             frame_meta: list[tuple[int, float]] = []
 
-            with Progress(console=console) as progress:
-                task = progress.add_task("Analyzing frames", total=dv.info.frame_count)
+            progress_columns = (
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TextColumn("eta"),
+                TimeRemainingColumn(),
+            )
+            with Progress(*progress_columns, console=console) as progress:
+                total = _estimate_analysis_frame_count(config, dv.info)
+                task = progress.add_task("Analyzing frames", total=total)
                 for af in dv.iter_analysis_frames(
                     analysis_scale=config.analysis_scale,
                     analysis_max_width=config.analysis_max_width,
