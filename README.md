@@ -21,14 +21,26 @@ carries no per-frame PTS.
 ## Quick start
 
 ```bash
-gs-frames extract take.mp4 out/ --preview --overlap 70-80
+gs-frames extract take.mp4 out/ --overlap 70-80
 ```
 
-This is phase 1: it writes `out/analysis.csv` (one row per analyzed frame,
-with Tenengrad/Laplacian/combined sharpness) and `out/manifest.json`
-(video metadata, resolved config, stats). No images are exported yet —
-image export lands in phase 2; running without `--preview` prints that and
-still exits 0 having written the CSV and manifest.
+This is phase 2: it writes `out/analysis.csv` (one row per analyzed frame,
+with Tenengrad/Laplacian/combined sharpness and a `selected` flag) and
+`out/manifest.json` (video metadata, resolved config, stats, per-selected-
+frame records), then exports the selected frames at full resolution to
+`out/images/frame_XXXXXX.jpg` (zero-padded original frame index). Pass
+`--preview` to skip image export and only write the CSV/manifest.
+
+Selection is currently `--mode time` (the only mode implemented so far;
+`overlap-greedy` becomes the default once phase 4 lands): the sharpest frame
+per `--chunk-frames N` or `--every-seconds N` window (default: one window per
+second), skipping frames below `--min-sharpness` (or the
+`--min-sharpness-percentile`, default 5th percentile, when unset). Cap the
+result with `--max-frames N`.
+
+Exported images are protected from accidental overwrite; pass `--force` to
+replace a prior export. Output format/quality: `--format jpg|png` and
+`--quality N` (JPEG only).
 
 ## iPhone footage
 

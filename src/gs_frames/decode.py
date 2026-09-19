@@ -14,7 +14,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional, Protocol
+from typing import Iterator, Optional, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -180,8 +180,10 @@ class _OpenCvBackend:
         return fps, (frame_count or None), width, height
 
     def iter_frames(self, start_frame: int = 0) -> Iterator[tuple[int, float, np.ndarray]]:
-        if start_frame:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        # Always repositioned explicitly (even to 0): a caller may invoke this
+        # after its own cap.set()/read() calls left the cursor elsewhere, e.g.
+        # the seek-with-fallback path in DecodedVideo.iter_export_frames.
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         index = start_frame
         nominal_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         warned_bad_timestamps = False
@@ -379,6 +381,74 @@ class DecodedVideo:
             assert target_w is not None and target_h is not None
             resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
             yield AnalysisFrame(index=index, timestamp_s=timestamp_s, frame=resized)
+
+    def iter_export_frames(self, indices: Sequence[int]) -> Iterator[tuple[int, np.ndarray]]:
+        """Yield (index, frame) for each requested index, full resolution and
+        rotated, in ascending order -- for winner export, re-opened separately
+        from the analysis pass.
+
+        Seeks directly to each index on backends that support it (OpenCV),
+        verifying the seek landed on the requested frame. A single
+        inaccurate/failed seek permanently downgrades the rest of this call
+        to one continuous sequential decode (no further seeks at all), since
+        seek reliability is a property of the file/codec, not of any one
+        frame -- re-seeking to "just before" each remaining target would
+        repeat the same unverified seek that triggered the fallback.
+        """
+        targets = sorted(set(indices))
+        if not targets:
+            return
+
+        backend = self._backend
+        if not isinstance(backend, _OpenCvBackend):
+            yield from self._sequential_export(targets)
+            return
+
+        cap = backend.cap
+        cursor = 0
+        seeking_reliable = True
+        sequential_frames: Optional[Iterator[tuple[int, float, np.ndarray]]] = None
+        for target in targets:
+            if seeking_reliable:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                landed = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES)))
+                if landed == target:
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        yield target, _apply_rotation(frame, backend._rotation)
+                        cursor = target + 1
+                        continue
+                logger.warning(
+                    "Frame seek landed inaccurately (requested index %d, backend "
+                    "reported %d); falling back to a single continuous sequential "
+                    "decode (no further seeks) for the remaining export frames.",
+                    target,
+                    landed,
+                )
+                seeking_reliable = False
+                sequential_frames = backend.iter_frames(start_frame=cursor)
+
+            assert sequential_frames is not None
+            found = False
+            for idx, _, frame in sequential_frames:
+                cursor = idx + 1
+                if idx == target:
+                    yield idx, frame
+                    found = True
+                    break
+                if idx > target:
+                    break
+            if not found:
+                logger.warning("Could not locate frame index %d during export; skipping.", target)
+
+    def _sequential_export(self, targets: list[int]) -> Iterator[tuple[int, np.ndarray]]:
+        target_set = set(targets)
+        last = targets[-1]
+        for idx, _, frame in self._backend.iter_frames(start_frame=0):
+            if idx in target_set:
+                yield idx, frame
+            if idx >= last:
+                return
 
     def close(self) -> None:
         self._backend.close()

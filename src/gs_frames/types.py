@@ -44,7 +44,7 @@ class ExtractConfig:
     target_overlap: Optional[float] = None
     sharpness: SharpnessMethod = "combined"
     overlap_metric: OverlapMetric = "orb"
-    mode: SelectMode = "overlap-greedy"
+    mode: SelectMode = "time"
     max_frames: Optional[int] = None
     min_sharpness: Optional[float] = None
     min_sharpness_percentile: float = 5.0
@@ -54,6 +54,7 @@ class ExtractConfig:
     chunk_frames: Optional[int] = None
     format: ImageFormat = "jpg"
     jpeg_quality: int = 95
+    force: bool = False
     preview: bool = False
     start_s: Optional[float] = None
     end_s: Optional[float] = None
@@ -84,6 +85,12 @@ class ExtractConfig:
             raise ConfigError(f"analysis_scale must be in (0, 1], got {self.analysis_scale}")
         if not (1 <= self.jpeg_quality <= 100):
             raise ConfigError(f"jpeg_quality must be in [1, 100], got {self.jpeg_quality}")
+        if self.chunk_frames is not None and self.every_seconds is not None:
+            raise ConfigError("--chunk-frames and --every-seconds are mutually exclusive")
+        if self.chunk_frames is not None and self.chunk_frames <= 0:
+            raise ConfigError(f"chunk_frames must be > 0, got {self.chunk_frames}")
+        if self.every_seconds is not None and self.every_seconds <= 0:
+            raise ConfigError(f"every_seconds must be > 0, got {self.every_seconds}")
         if self.start_s is not None and self.end_s is not None and self.start_s >= self.end_s:
             raise ConfigError(f"start_s ({self.start_s}) must be < end_s ({self.end_s})")
         if (

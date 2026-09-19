@@ -24,7 +24,8 @@ def test_preview_writes_csv_row_per_analyzed_frame(synthetic_video, tmp_path):
     with csv_path.open() as f:
         rows = list(csv.DictReader(f))
     assert len(rows) == 30
-    assert all(row["selected"] == "0" for row in rows)
+    selected = [row for row in rows if row["selected"] == "1"]
+    assert 0 < len(selected) < 30  # time-windowed selection picks some, not all
 
 
 def test_preview_writes_no_images(synthetic_video, tmp_path):
@@ -33,13 +34,38 @@ def test_preview_writes_no_images(synthetic_video, tmp_path):
     assert not (out / "images").exists()
 
 
-def test_without_preview_still_writes_csv_and_exits_zero(synthetic_video, tmp_path):
+def test_without_preview_exports_images_matching_selected_count(synthetic_video, tmp_path):
     out = tmp_path / "out"
     result = runner.invoke(app, ["extract", str(synthetic_video), str(out)])
     assert result.exit_code == 0, result.output
-    assert "phase 2" in result.output
     assert (out / "analysis.csv").exists()
-    assert not (out / "images").exists()
+
+    with (out / "analysis.csv").open() as f:
+        rows = list(csv.DictReader(f))
+    selected_indices = {int(row["index"]) for row in rows if row["selected"] == "1"}
+    assert selected_indices
+
+    images = sorted((out / "images").glob("frame_*.jpg"))
+    assert {int(p.stem.split("_")[1]) for p in images} == selected_indices
+
+
+def test_without_preview_requires_force_to_overwrite_existing_images(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    first = runner.invoke(app, ["extract", str(synthetic_video), str(out)])
+    assert first.exit_code == 0, first.output
+
+    second = runner.invoke(app, ["extract", str(synthetic_video), str(out)])
+    assert second.exit_code == 1
+
+    third = runner.invoke(app, ["extract", str(synthetic_video), str(out), "--force"])
+    assert third.exit_code == 0, third.output
+
+
+def test_mode_other_than_time_is_not_yet_implemented(synthetic_video, tmp_path):
+    result = runner.invoke(
+        app, ["extract", str(synthetic_video), str(tmp_path / "out"), "--mode", "flow"]
+    )
+    assert result.exit_code == 1
 
 
 def test_manifest_records_rotation_and_source(synthetic_video, tmp_path):
@@ -54,6 +80,9 @@ def test_manifest_records_rotation_and_source(synthetic_video, tmp_path):
         "none_detected",
     }
     assert manifest["stats"]["analyzed"] == 30
+    assert manifest["stats"]["selected"] > 0
+    assert len(manifest["frames"]) == manifest["stats"]["selected"]
+    assert manifest["frames"][0]["reason"] == "time-window"
 
 
 def test_missing_video_is_user_error(tmp_path):

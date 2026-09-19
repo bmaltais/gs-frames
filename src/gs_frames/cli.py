@@ -4,7 +4,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import typer
@@ -22,8 +22,17 @@ from rich.progress import (
 )
 
 from gs_frames import __version__
-from gs_frames import decode, sharpness
-from gs_frames.types import ConfigError, ExtractConfig, FrameScore, RotationMode, SharpnessMethod
+from gs_frames import decode, export, select, sharpness
+from gs_frames.types import (
+    ConfigError,
+    ExtractConfig,
+    FrameScore,
+    ImageFormat,
+    RotationMode,
+    Selection,
+    SelectMode,
+    SharpnessMethod,
+)
 
 app = typer.Typer(add_completion=False)
 console = Console()
@@ -63,6 +72,22 @@ def _estimate_analysis_frame_count(
     if end_frame is None:
         return None
     return max(0, end_frame - start_frame)
+
+
+def _selection_stats(selections: list[Selection]) -> tuple[int, int]:
+    """(in_range, fallback) counts derived from selection reasons -- shared by
+    the manifest and the final console summary so they can't drift apart."""
+    in_range = sum(1 for s in selections if s.reason == "in-range")
+    fallback = sum(1 for s in selections if s.reason == "fallback-closest")
+    return in_range, fallback
+
+
+def _rotation_mode_for(applied_degrees: int) -> RotationMode:
+    """The explicit RotationMode that reproduces an already-resolved rotation,
+    so re-opening the video for export doesn't re-run auto-detection."""
+    if applied_degrees == 0:
+        return "none"
+    return cast(RotationMode, str(applied_degrees))
 
 
 def _setup_logging(log_path: Path) -> None:
@@ -110,10 +135,12 @@ def _write_manifest(
     config: ExtractConfig,
     video_info: decode.VideoInfo,
     analyzed: int,
+    selections: list[Selection],
 ) -> None:
     config_dict = dataclasses.asdict(config)
     config_dict["video"] = str(config.video)
     config_dict["output_dir"] = str(config.output_dir)
+    in_range, fallback = _selection_stats(selections)
 
     manifest = {
         "version": __version__,
@@ -129,11 +156,11 @@ def _write_manifest(
         "config": config_dict,
         "stats": {
             "analyzed": analyzed,
-            "selected": 0,
-            "in_range": 0,
-            "fallback": 0,
+            "selected": len(selections),
+            "in_range": in_range,
+            "fallback": fallback,
         },
-        "frames": [],
+        "frames": [dataclasses.asdict(s) for s in selections],
     }
     path.write_text(json.dumps(manifest, indent=2))
 
@@ -157,8 +184,33 @@ def extract(
     workers: int = typer.Option(1, "--workers"),
     rotate: RotationMode = typer.Option("auto", "--rotate"),
     no_container_timestamps: bool = typer.Option(False, "--no-container-timestamps"),
+    mode: SelectMode = typer.Option("time", "--mode", help="Selection mode."),
+    chunk_frames: Optional[int] = typer.Option(
+        None, "--chunk-frames", help="--mode time: pick the sharpest frame every N frames."
+    ),
+    every_seconds: Optional[float] = typer.Option(
+        None, "--every-seconds", help="--mode time: pick the sharpest frame every N seconds."
+    ),
+    max_frames: Optional[int] = typer.Option(None, "--max-frames", help="Cap selected frames."),
+    min_sharpness: Optional[float] = typer.Option(
+        None, "--min-sharpness", help="Frames below this score are never selected."
+    ),
+    min_sharpness_percentile: float = typer.Option(
+        5.0, "--min-sharpness-percentile", help="Used when --min-sharpness is unset."
+    ),
+    image_format: ImageFormat = typer.Option("jpg", "--format"),
+    quality: int = typer.Option(95, "--quality", help="JPEG quality (1-100)."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing exported images."),
 ) -> None:
-    """Analyze VIDEO and (from phase 2 onward) export selected frames to OUTPUT_DIR."""
+    """Analyze VIDEO and export selected frames to OUTPUT_DIR."""
+    if mode not in select.IMPLEMENTED_MODES:
+        console.print(
+            f"[red]error:[/red] --mode {mode} is not implemented yet; "
+            f"this build supports only {sorted(select.IMPLEMENTED_MODES)} "
+            "(overlap-greedy becomes the default in phase 4)."
+        )
+        raise typer.Exit(1)
+
     lo, hi = _parse_overlap(overlap)
     if overlap_min is not None or overlap_max is not None:
         if overlap != "70-80":
@@ -174,8 +226,17 @@ def extract(
             overlap_max=hi,
             target_overlap=target_overlap,
             sharpness=sharpness_method,
+            mode=mode,
             analysis_scale=analysis_scale,
             analysis_max_width=analysis_max_width,
+            chunk_frames=chunk_frames,
+            every_seconds=every_seconds,
+            max_frames=max_frames,
+            min_sharpness=min_sharpness,
+            min_sharpness_percentile=min_sharpness_percentile,
+            format=image_format,
+            jpeg_quality=quality,
+            force=force,
             preview=preview,
             start_s=start_seconds,
             end_s=end_seconds,
@@ -253,22 +314,52 @@ def extract(
         for i, (idx, ts) in enumerate(frame_meta)
     ]
 
-    _write_analysis_csv(config.output_dir / "analysis.csv", scores, selected=set())
+    with console.status("Selecting frames..."):
+        selections = select.select_frames(scores, config)
+
+    _write_analysis_csv(
+        config.output_dir / "analysis.csv", scores, selected={s.index for s in selections}
+    )
     _write_manifest(
         config.output_dir / "manifest.json",
         config=config,
         video_info=dv.info,
         analyzed=len(scores),
+        selections=selections,
     )
 
-    if not config.preview:
-        console.print("Image export lands in phase 2; wrote analysis.csv and manifest.json only.")
+    if config.preview:
+        console.print("[dim]--preview: skipping image export.[/dim]")
+    elif selections:
+        export_rotation = _rotation_mode_for(dv.info.rotation_applied)
+        try:
+            with decode.open_video(
+                config.video, export_rotation, config.use_container_timestamps
+            ) as export_dv:
+                with Progress(*progress_columns, console=console) as progress:
+                    task = progress.add_task("Exporting frames", total=len(selections))
+                    export.export_images(
+                        export_dv.iter_export_frames,
+                        selections,
+                        config.output_dir / "images",
+                        image_format=config.format,
+                        jpeg_quality=config.jpeg_quality,
+                        force=config.force,
+                        on_frame=lambda _index: progress.advance(task),
+                    )
+        except ConfigError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(1)
+        except (RuntimeError, OSError) as exc:
+            console.print(f"[red]error:[/red] failed to export images: {exc}")
+            raise typer.Exit(2)
 
+    in_range, fallback = _selection_stats(selections)
     console.print(
         f"frames analyzed: {len(scores)}\n"
-        f"frames selected: 0\n"
-        f"overlap in-range: 0\n"
-        f"overlap fallback: 0\n"
+        f"frames selected: {len(selections)}\n"
+        f"overlap in-range: {in_range}\n"
+        f"overlap fallback: {fallback}\n"
         f"output: {config.output_dir / 'images'}"
     )
 
