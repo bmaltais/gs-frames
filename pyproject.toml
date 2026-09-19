@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gs-frames"
+version = "0.1.0"
+description = "Extract sharp, overlap-aware stills from video for 3D Gaussian Splatting and COLMAP."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.26",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+gs-frames = "gs_frames.cli:app"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gs_frames"]
