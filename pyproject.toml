@@ -20,7 +20,20 @@ dependencies = [
 gs-frames = "gs_frames.cli:app"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gs_frames"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["gs_frames"]
+mypy_path = "src"
+explicit_package_bases = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "cv2.*"
+ignore_missing_imports = true

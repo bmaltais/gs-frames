@@ -14,7 +14,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Protocol
 
 import cv2
 import numpy as np
@@ -124,19 +124,28 @@ def _detect_rotation(
         return int(rotation_mode) if rotation_mode != "none" else 0, "user_override"
 
     if cap is not None:
-        rotation = _probe_rotation_cv2(cap)
-        if rotation:
-            return rotation, "container_meta"
+        cv2_rotation = _probe_rotation_cv2(cap)
+        if cv2_rotation:
+            return cv2_rotation, "container_meta"
 
-    rotation = _probe_rotation_ffprobe(path)
-    if rotation is not None:
-        return rotation, "ffprobe"
+    ffprobe_rotation = _probe_rotation_ffprobe(path)
+    if ffprobe_rotation is not None:
+        return ffprobe_rotation, "ffprobe"
 
     logger.warning(
         "Could not verify video rotation (no container metadata, ffprobe unavailable or "
         "inconclusive); proceeding with rotation=0."
     )
     return 0, "none_detected"
+
+
+class _DecodeBackend(Protocol):
+    """Common shape of the two decode backends (OpenCV, ffmpeg-subprocess fallback)."""
+
+    def usable(self) -> bool: ...
+    def raw_info(self) -> tuple[float, Optional[int], int, int]: ...
+    def iter_frames(self, start_frame: int = 0) -> Iterator[tuple[int, float, np.ndarray]]: ...
+    def close(self) -> None: ...
 
 
 class _OpenCvBackend:
@@ -300,6 +309,7 @@ class DecodedVideo:
         probe_cap = cv2_backend.cap if cv2_usable else None
         rotation, rotation_source = _detect_rotation(path, probe_cap, rotation_mode)
 
+        self._backend: _DecodeBackend
         if cv2_usable:
             cv2_backend._rotation = rotation
             self._backend = cv2_backend
@@ -360,6 +370,7 @@ class DecodedVideo:
                 src_h, src_w = frame.shape[:2]
                 target_w = max(1, min(round(src_w * analysis_scale), analysis_max_width))
                 target_h = max(1, round(src_h * target_w / src_w))
+            assert target_w is not None and target_h is not None
             resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
             yield AnalysisFrame(index=index, timestamp_s=timestamp_s, frame=resized)
 
