@@ -24,17 +24,27 @@ carries no per-frame PTS.
 gs-frames extract take.mp4 out/ --overlap 70-80
 ```
 
-This is phase 2: it writes `out/analysis.csv` (one row per analyzed frame,
-with Tenengrad/Laplacian/combined sharpness and a `selected` flag) and
-`out/manifest.json` (video metadata, resolved config, stats, per-selected-
-frame records), then exports the selected frames at full resolution to
-`out/images/frame_XXXXXX.jpg` (zero-padded original frame index). Pass
-`--preview` to skip image export and only write the CSV/manifest.
+This is phase 3: it writes `out/analysis.csv` (one row per analyzed frame,
+with Tenengrad/Laplacian/combined sharpness, a DIS-optical-flow `flow_median`
+score, and a `selected` flag) and `out/manifest.json` (video metadata,
+resolved config, stats, per-selected-frame records), then exports the
+selected frames at full resolution to `out/images/frame_XXXXXX.jpg`
+(zero-padded original frame index). Pass `--preview` to skip image export
+and only write the CSV/manifest.
 
-Selection is currently `--mode time` (the only mode implemented so far;
-`overlap-greedy` becomes the default once phase 4 lands): the sharpest frame
-per `--chunk-frames N` or `--every-seconds N` window (default: one window per
-second), skipping frames below `--min-sharpness` (or the
+Selection defaults to `--mode time` (`overlap-greedy` becomes the default
+once phase 4 lands):
+
+- `--mode time`: sharpest frame per `--chunk-frames N` or `--every-seconds N`
+  window (default: one window per second).
+- `--mode flow`: motion-adaptive windows -- a window closes once the running
+  sum of `flow_median` (DIS optical flow magnitude between consecutive
+  analysis frames) since the last window reaches `--flow-trigger` (default
+  `8.0`), so static segments produce fewer, wider windows and fast motion
+  produces more, narrower ones. Accumulation is frame-index driven, not
+  timestamp driven, so VFR doesn't skew window sizing.
+
+Both modes skip frames below `--min-sharpness` (or the
 `--min-sharpness-percentile`, default 5th percentile, when unset). Cap the
 result with `--max-frames N`.
 

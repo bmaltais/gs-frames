@@ -63,6 +63,11 @@ class ExtractConfig:
     workers: int = 1
     seed_policy: str = "first-usable"
     flow_cell_size: int = 16
+    # Sum of per-frame flow_median (analysis-resolution pixels) since the
+    # last window boundary that closes a --mode flow window. A starting
+    # point, not a physically-derived constant -- tune per source with
+    # --flow-trigger the same way --every-seconds is tuned for --mode time.
+    flow_trigger: float = 8.0
     orb_nfeatures: int = 1500
     match_ratio: float = 0.75
     ransac_reproj_threshold: float = 3.0
@@ -91,6 +96,8 @@ class ExtractConfig:
             raise ConfigError(f"chunk_frames must be > 0, got {self.chunk_frames}")
         if self.every_seconds is not None and self.every_seconds <= 0:
             raise ConfigError(f"every_seconds must be > 0, got {self.every_seconds}")
+        if self.flow_trigger <= 0:
+            raise ConfigError(f"flow_trigger must be > 0, got {self.flow_trigger}")
         if self.start_s is not None and self.end_s is not None and self.start_s >= self.end_s:
             raise ConfigError(f"start_s ({self.start_s}) must be < end_s ({self.end_s})")
         if (

@@ -61,11 +61,30 @@ def test_without_preview_requires_force_to_overwrite_existing_images(synthetic_v
     assert third.exit_code == 0, third.output
 
 
-def test_mode_other_than_time_is_not_yet_implemented(synthetic_video, tmp_path):
+def test_unimplemented_mode_is_a_user_error(synthetic_video, tmp_path):
     result = runner.invoke(
-        app, ["extract", str(synthetic_video), str(tmp_path / "out"), "--mode", "flow"]
+        app, ["extract", str(synthetic_video), str(tmp_path / "out"), "--mode", "overlap-greedy"]
     )
     assert result.exit_code == 1
+
+
+def test_mode_flow_exports_images_matching_selected_count(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app, ["extract", str(synthetic_video), str(out), "--mode", "flow", "--flow-trigger", "0.5"]
+    )
+    assert result.exit_code == 0, result.output
+
+    with (out / "analysis.csv").open() as f:
+        rows = list(csv.DictReader(f))
+    selected_indices = {int(row["index"]) for row in rows if row["selected"] == "1"}
+    assert selected_indices
+
+    images = sorted((out / "images").glob("frame_*.jpg"))
+    assert {int(p.stem.split("_")[1]) for p in images} == selected_indices
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["frames"][0]["reason"] == "flow-window"
 
 
 def test_manifest_records_rotation_and_source(synthetic_video, tmp_path):

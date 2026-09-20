@@ -22,7 +22,7 @@ from rich.progress import (
 )
 
 from gs_frames import __version__
-from gs_frames import decode, export, select, sharpness
+from gs_frames import decode, export, motion, select, sharpness
 from gs_frames.types import (
     ConfigError,
     ExtractConfig,
@@ -192,6 +192,9 @@ def extract(
     every_seconds: Optional[float] = typer.Option(
         None, "--every-seconds", help="--mode time: pick the sharpest frame every N seconds."
     ),
+    flow_trigger: float = typer.Option(
+        8.0, "--flow-trigger", help="--mode flow: accumulated flow_median that closes a window."
+    ),
     max_frames: Optional[int] = typer.Option(None, "--max-frames", help="Cap selected frames."),
     min_sharpness: Optional[float] = typer.Option(
         None, "--min-sharpness", help="Frames below this score are never selected."
@@ -232,6 +235,7 @@ def extract(
             analysis_max_width=analysis_max_width,
             chunk_frames=chunk_frames,
             every_seconds=every_seconds,
+            flow_trigger=flow_trigger,
             max_frames=max_frames,
             min_sharpness=min_sharpness,
             min_sharpness_percentile=min_sharpness_percentile,
@@ -260,7 +264,9 @@ def extract(
             logger.info("resolved overlap range: [%.2f, %.2f]", config.overlap_min, config.overlap_max)
             tenengrad_vals: list[float] = []
             laplacian_vals: list[float] = []
+            flow_vals: list[float] = []
             frame_meta: list[tuple[int, float]] = []
+            prev_gray: Optional[np.ndarray] = None
 
             progress_columns = (
                 SpinnerColumn(),
@@ -286,6 +292,12 @@ def extract(
                     gray = sharpness.to_gray(af.frame)
                     tenengrad_vals.append(sharpness.tenengrad(gray))
                     laplacian_vals.append(sharpness.laplacian_variance(gray))
+                    flow_vals.append(
+                        motion.flow_median(prev_gray, gray, cell_size=config.flow_cell_size)
+                        if prev_gray is not None
+                        else 0.0
+                    )
+                    prev_gray = gray
                     frame_meta.append((af.index, af.timestamp_s))
                     progress.advance(task)
     except (RuntimeError, OSError) as exc:
@@ -311,6 +323,7 @@ def extract(
             sharpness=chosen[i],
             sharpness_tenengrad=tenengrad_vals[i],
             sharpness_laplacian=laplacian_vals[i],
+            flow_median=flow_vals[i],
         )
         for i, (idx, ts) in enumerate(frame_meta)
     ]
