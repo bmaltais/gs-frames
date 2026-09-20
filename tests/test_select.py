@@ -1,8 +1,15 @@
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
-from gs_frames.select import resolve_min_sharpness, select_flow, select_frames, select_time
+from gs_frames.select import (
+    resolve_min_sharpness,
+    select_flow,
+    select_frames,
+    select_overlap_greedy,
+    select_time,
+)
 from gs_frames.types import ConfigError, ExtractConfig, FrameScore
 
 
@@ -92,7 +99,7 @@ def test_select_frames_dispatches_time_mode():
 def test_select_frames_raises_for_unimplemented_modes():
     scores = [_score(0, 0.0, 1.0)]
     with pytest.raises(NotImplementedError):
-        select_frames(scores, _config(mode="overlap-greedy"))
+        select_frames(scores, _config(mode="overlap-beam"))
 
 
 def test_chunk_frames_and_every_seconds_are_mutually_exclusive():
@@ -156,3 +163,182 @@ def test_select_frames_dispatches_flow_mode():
     assert select_frames(scores, _config(mode="flow", flow_trigger=5.0)) == select_flow(
         scores, _config(flow_trigger=5.0)
     )
+
+
+def _fake_overlap_fn(overlaps: dict[tuple[int, int], float]):
+    def fn(last_kept_index: int, candidate_index: int) -> Optional[float]:
+        return overlaps.get((last_kept_index, candidate_index))
+
+    return fn
+
+
+def test_select_overlap_greedy_empty_input_returns_empty():
+    assert select_overlap_greedy([], _config()) == []
+
+
+def test_select_overlap_greedy_max_frames_le_zero_returns_empty():
+    scores = [_score(0, 0.0, sharpness=5.0)]
+    assert select_overlap_greedy(scores, _config(max_frames=0)) == []
+
+
+def test_select_overlap_greedy_seed_is_first_frame_at_or_above_floor():
+    scores = [_score(i, i * 0.1, sharpness=1.0 if i < 2 else 10.0) for i in range(5)]
+    selections = select_overlap_greedy(
+        scores, _config(min_sharpness=5.0, max_frames=1), overlap_fn=lambda a, b: None
+    )
+    assert [s.index for s in selections] == [2]
+    assert selections[0].reason == "seed"
+    assert selections[0].overlap_with_prev is None
+
+
+def test_select_overlap_greedy_prefers_sharpest_in_range_candidate():
+    scores = [
+        _score(0, 0.0, sharpness=5.0),
+        _score(1, 0.1, sharpness=9.0),
+        _score(2, 0.2, sharpness=7.0),
+        _score(3, 0.3, sharpness=10.0),
+    ]
+    overlaps = {(0, 1): 0.5, (0, 2): 0.75, (0, 3): 0.95}
+    selections = select_overlap_greedy(
+        scores,
+        _config(overlap_min=0.7, overlap_max=0.8, min_sharpness=0.0, max_frames=2),
+        overlap_fn=_fake_overlap_fn(overlaps),
+    )
+    assert [s.index for s in selections] == [0, 2]
+    assert selections[1].reason == "in-range"
+    assert selections[1].overlap_with_prev == 0.75
+
+
+def test_select_overlap_greedy_falls_back_to_closest_to_target_with_sharpness_tiebreak():
+    scores = [
+        _score(0, 0.0, sharpness=5.0),
+        _score(1, 0.1, sharpness=8.0),
+        _score(2, 0.2, sharpness=9.0),
+    ]
+    overlaps = {(0, 1): 0.6, (0, 2): 0.9}  # both 0.15 away from target_overlap == 0.75
+    selections = select_overlap_greedy(
+        scores,
+        _config(overlap_min=0.7, overlap_max=0.8, min_sharpness=0.0, max_frames=2),
+        overlap_fn=_fake_overlap_fn(overlaps),
+    )
+    assert [s.index for s in selections] == [0, 2]  # tie broken by higher sharpness
+    assert selections[1].reason == "fallback-closest"
+    assert selections[1].overlap_with_prev == 0.9
+
+
+def test_select_overlap_greedy_falls_back_to_sharpest_when_all_overlap_measurements_fail():
+    scores = [
+        _score(0, 0.0, sharpness=5.0),
+        _score(1, 0.1, sharpness=8.0),
+        _score(2, 0.2, sharpness=12.0),
+    ]
+    selections = select_overlap_greedy(
+        scores, _config(min_sharpness=0.0, max_frames=2), overlap_fn=lambda a, b: None
+    )
+    assert [s.index for s in selections] == [0, 2]
+    assert selections[1].reason == "fallback-closest"
+    assert selections[1].overlap_with_prev is None
+
+
+def test_select_overlap_greedy_bounds_pool_once_index_distance_and_flow_both_exceed_threshold():
+    scores = [
+        _score(0, 0.0, sharpness=5.0, flow_median=0.0),
+        _score(1, 0.1, sharpness=6.0, flow_median=10.0),
+        _score(2, 0.2, sharpness=7.0, flow_median=10.0),
+        _score(3, 0.3, sharpness=20.0, flow_median=10.0),  # would be a perfect in-range pick...
+        _score(4, 0.4, sharpness=20.0, flow_median=10.0),
+    ]
+    # ...but idx3/idx4 sit outside the search window once BOTH index distance
+    # (> search_expand_frames=2) and accumulated flow (> 3 * flow_trigger=24)
+    # have exceeded their bounds, so their overlap is never even measured.
+    overlaps = {(0, 1): 0.5, (0, 2): 0.55, (0, 3): 0.75, (0, 4): 0.75}
+    selections = select_overlap_greedy(
+        scores,
+        _config(
+            overlap_min=0.7,
+            overlap_max=0.8,
+            min_sharpness=0.0,
+            search_expand_frames=2,
+            flow_trigger=8.0,
+            max_frames=2,
+        ),
+        overlap_fn=_fake_overlap_fn(overlaps),
+    )
+    assert [s.index for s in selections] == [0, 2]  # closest-to-target among the reachable {1, 2}
+    assert selections[1].reason == "fallback-closest"
+
+
+def test_select_overlap_greedy_stops_pool_growth_after_low_overlap_streak():
+    # 8 consecutive candidates measured well below overlap_min - 0.15 trip
+    # the early-stop; a 9th candidate with a great overlap is never reached.
+    scores = [_score(0, 0.0, sharpness=5.0)] + [
+        _score(i, i * 0.1, sharpness=float(i)) for i in range(1, 10)
+    ]
+    overlaps = {(0, i): 0.3 for i in range(1, 9)}
+    overlaps[(0, 9)] = 0.75
+    selections = select_overlap_greedy(
+        scores,
+        _config(overlap_min=0.7, overlap_max=0.8, min_sharpness=0.0, max_frames=2),
+        overlap_fn=_fake_overlap_fn(overlaps),
+    )
+    assert selections[1].index != 9
+    assert selections[1].index == 8  # sharpest among the 8 equally-far-off candidates
+    assert selections[1].reason == "fallback-closest"
+
+
+def test_select_overlap_greedy_respects_max_frames_cap():
+    scores = [_score(i, i * 0.1, sharpness=float(i)) for i in range(10)]
+    overlaps = {(i, i + 1): 0.75 for i in range(9)}
+    selections = select_overlap_greedy(
+        scores,
+        _config(overlap_min=0.7, overlap_max=0.8, min_sharpness=0.0, max_frames=3),
+        overlap_fn=_fake_overlap_fn(overlaps),
+    )
+    assert len(selections) == 3
+
+
+def test_select_overlap_greedy_flow_metric_computes_overlap_without_overlap_fn():
+    scores = [
+        _score(0, 0.0, sharpness=5.0, flow_median=0.0),
+        _score(1, 0.1, sharpness=6.0, flow_median=1.0),
+        _score(2, 0.2, sharpness=7.0, flow_median=20.0),
+    ]
+    selections = select_overlap_greedy(
+        scores,
+        _config(
+            overlap_metric="flow",
+            flow_trigger=8.0,
+            overlap_min=0.9,
+            overlap_max=1.0,
+            min_sharpness=0.0,
+            max_frames=2,
+        ),
+    )  # no overlap_fn passed: "flow" never needs one
+    assert [s.index for s in selections] == [0, 1]
+    assert selections[1].reason == "in-range"
+    assert selections[1].overlap_with_prev == pytest.approx(1 - 1 / 24, abs=1e-6)
+
+
+def test_select_overlap_greedy_none_metric_always_falls_back():
+    scores = [_score(i, i * 0.1, sharpness=float(i)) for i in range(4)]
+    selections = select_overlap_greedy(
+        scores, _config(overlap_metric="none", min_sharpness=0.0, max_frames=2)
+    )
+    assert [s.index for s in selections] == [0, 3]  # sharpest remaining; overlap never measured
+    assert selections[1].reason == "fallback-closest"
+    assert selections[1].overlap_with_prev is None
+
+
+def test_select_overlap_greedy_requires_overlap_fn_for_orb_metric():
+    scores = [_score(0, 0.0, sharpness=5.0), _score(1, 0.1, sharpness=6.0)]
+    with pytest.raises(ValueError):
+        select_overlap_greedy(scores, _config(min_sharpness=0.0))
+
+
+def test_select_frames_dispatches_overlap_greedy_mode():
+    scores = [_score(0, 0.0, sharpness=5.0), _score(1, 0.1, sharpness=6.0)]
+    overlaps = {(0, 1): 0.75}
+    config = _config(mode="overlap-greedy", overlap_min=0.7, overlap_max=0.8, min_sharpness=0.0)
+    assert select_frames(
+        scores, config, overlap_fn=_fake_overlap_fn(overlaps)
+    ) == select_overlap_greedy(scores, config, overlap_fn=_fake_overlap_fn(overlaps))

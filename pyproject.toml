@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gs-frames"
-version = "0.3.0"
+version = "0.4.0"
 description = "Extract sharp, overlap-aware stills from video for 3D Gaussian Splatting and COLMAP."
 readme = "README.md"
 license = "MIT"

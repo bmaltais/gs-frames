@@ -23,11 +23,16 @@ from rich.progress import (
 
 from gs_frames import __version__
 from gs_frames import decode, export, motion, select, sharpness
+
+# Aliased: `extract()` below has an `overlap: str` parameter (the --overlap
+# flag) that would otherwise shadow this module name in its own body.
+from gs_frames import overlap as overlap_metrics
 from gs_frames.types import (
     ConfigError,
     ExtractConfig,
     FrameScore,
     ImageFormat,
+    OverlapMetric,
     RotationMode,
     Selection,
     SelectMode,
@@ -185,7 +190,7 @@ def extract(
     workers: int = typer.Option(1, "--workers"),
     rotate: RotationMode = typer.Option("auto", "--rotate"),
     no_container_timestamps: bool = typer.Option(False, "--no-container-timestamps"),
-    mode: SelectMode = typer.Option("time", "--mode", help="Selection mode."),
+    mode: SelectMode = typer.Option("overlap-greedy", "--mode", help="Selection mode."),
     chunk_frames: Optional[int] = typer.Option(
         None, "--chunk-frames", help="--mode time: pick the sharpest frame every N frames."
     ),
@@ -193,7 +198,29 @@ def extract(
         None, "--every-seconds", help="--mode time: pick the sharpest frame every N seconds."
     ),
     flow_trigger: float = typer.Option(
-        8.0, "--flow-trigger", help="--mode flow: accumulated flow_median that closes a window."
+        8.0,
+        "--flow-trigger",
+        help="--mode flow: accumulated flow_median that closes a window. Also used by "
+        "--mode overlap-greedy to size its candidate search window.",
+    ),
+    overlap_metric: OverlapMetric = typer.Option(
+        "orb", "--overlap-metric", help="--mode overlap-greedy: how to estimate frame-pair overlap."
+    ),
+    search_expand_frames: int = typer.Option(
+        60,
+        "--search-expand-frames",
+        help="--mode overlap-greedy: candidate-pool index-distance bound from the last-kept frame.",
+    ),
+    orb_nfeatures: int = typer.Option(
+        1500, "--orb-nfeatures", help="--overlap-metric orb/homography: ORB feature count."
+    ),
+    match_ratio: float = typer.Option(
+        0.75, "--match-ratio", help="--overlap-metric orb/homography: Lowe's ratio test threshold."
+    ),
+    ransac_reproj_threshold: float = typer.Option(
+        3.0,
+        "--ransac-reproj-threshold",
+        help="--overlap-metric homography: RANSAC reprojection threshold (pixels).",
     ),
     max_frames: Optional[int] = typer.Option(None, "--max-frames", help="Cap selected frames."),
     min_sharpness: Optional[float] = typer.Option(
@@ -211,7 +238,7 @@ def extract(
         console.print(
             f"[red]error:[/red] --mode {mode} is not implemented yet; "
             f"this build supports only {sorted(select.IMPLEMENTED_MODES)} "
-            "(overlap-greedy becomes the default in phase 4)."
+            "(overlap-beam lands in phase 5)."
         )
         raise typer.Exit(1)
 
@@ -236,6 +263,11 @@ def extract(
             chunk_frames=chunk_frames,
             every_seconds=every_seconds,
             flow_trigger=flow_trigger,
+            overlap_metric=overlap_metric,
+            search_expand_frames=search_expand_frames,
+            orb_nfeatures=orb_nfeatures,
+            match_ratio=match_ratio,
+            ransac_reproj_threshold=ransac_reproj_threshold,
             max_frames=max_frames,
             min_sharpness=min_sharpness,
             min_sharpness_percentile=min_sharpness_percentile,
@@ -259,9 +291,18 @@ def extract(
     _setup_logging(config.output_dir / "gs-frames.log")
     logger = logging.getLogger("gs_frames.cli")
 
+    # ORB/homography overlap need real (downscaled) frame data to compare
+    # arbitrary candidate pairs later during selection; "flow"/"none" don't,
+    # so this cache is skipped whenever it wouldn't be used.
+    needs_gray_cache = (
+        config.mode == "overlap-greedy" and config.overlap_metric in overlap_metrics.METRICS_NEEDING_IMAGES
+    )
+    gray_by_index: dict[int, np.ndarray] = {}
+
     try:
         with decode.open_video(config.video, config.rotation, config.use_container_timestamps) as dv:
             logger.info("resolved overlap range: [%.2f, %.2f]", config.overlap_min, config.overlap_max)
+            logger.info("overlap metric: %s", config.overlap_metric)
             tenengrad_vals: list[float] = []
             laplacian_vals: list[float] = []
             flow_vals: list[float] = []
@@ -290,6 +331,8 @@ def extract(
                     end_s=config.end_s,
                 ):
                     gray = sharpness.to_gray(af.frame)
+                    if needs_gray_cache:
+                        gray_by_index[af.index] = gray
                     tenengrad_vals.append(sharpness.tenengrad(gray))
                     laplacian_vals.append(sharpness.laplacian_variance(gray))
                     flow_vals.append(
@@ -328,8 +371,12 @@ def extract(
         for i, (idx, ts) in enumerate(frame_meta)
     ]
 
+    overlap_fn: Optional[overlap_metrics.OverlapFn] = None
+    if needs_gray_cache:
+        overlap_fn = overlap_metrics.make_overlap_fn(gray_by_index.__getitem__, config)
+
     with console.status("Selecting frames..."):
-        selections = select.select_frames(scores, config)
+        selections = select.select_frames(scores, config, overlap_fn=overlap_fn)
 
     _write_analysis_csv(
         config.output_dir / "analysis.csv", scores, selected={s.index for s in selections}

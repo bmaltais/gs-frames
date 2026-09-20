@@ -25,7 +25,7 @@ def test_preview_writes_csv_row_per_analyzed_frame(synthetic_video, tmp_path):
         rows = list(csv.DictReader(f))
     assert len(rows) == 30
     selected = [row for row in rows if row["selected"] == "1"]
-    assert 0 < len(selected) < 30  # time-windowed selection picks some, not all
+    assert 0 < len(selected) < 30  # overlap-greedy selection picks some, not all
 
 
 def test_preview_writes_no_images(synthetic_video, tmp_path):
@@ -63,9 +63,63 @@ def test_without_preview_requires_force_to_overwrite_existing_images(synthetic_v
 
 def test_unimplemented_mode_is_a_user_error(synthetic_video, tmp_path):
     result = runner.invoke(
-        app, ["extract", str(synthetic_video), str(tmp_path / "out"), "--mode", "overlap-greedy"]
+        app, ["extract", str(synthetic_video), str(tmp_path / "out"), "--mode", "overlap-beam"]
     )
     assert result.exit_code == 1
+
+
+def test_mode_overlap_greedy_is_now_the_default(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    result = runner.invoke(app, ["extract", str(synthetic_video), str(out), "--preview"])
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["config"]["mode"] == "overlap-greedy"
+    assert manifest["frames"][0]["reason"] == "seed"
+
+
+def test_mode_overlap_greedy_exports_images_matching_selected_count(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app, ["extract", str(synthetic_video), str(out), "--mode", "overlap-greedy"]
+    )
+    assert result.exit_code == 0, result.output
+
+    with (out / "analysis.csv").open() as f:
+        rows = list(csv.DictReader(f))
+    selected_indices = {int(row["index"]) for row in rows if row["selected"] == "1"}
+    assert selected_indices
+
+    images = sorted((out / "images").glob("frame_*.jpg"))
+    assert {int(p.stem.split("_")[1]) for p in images} == selected_indices
+
+
+def test_mode_overlap_greedy_with_flow_metric_needs_no_orb(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            str(synthetic_video),
+            str(out),
+            "--mode",
+            "overlap-greedy",
+            "--overlap-metric",
+            "flow",
+            "--preview",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["stats"]["selected"] > 0
+
+
+def test_mode_time_exports_images_matching_selected_count(synthetic_video, tmp_path):
+    out = tmp_path / "out"
+    result = runner.invoke(app, ["extract", str(synthetic_video), str(out), "--mode", "time"])
+    assert result.exit_code == 0, result.output
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["frames"][0]["reason"] == "time-window"
 
 
 def test_mode_flow_exports_images_matching_selected_count(synthetic_video, tmp_path):
@@ -101,7 +155,7 @@ def test_manifest_records_rotation_and_source(synthetic_video, tmp_path):
     assert manifest["stats"]["analyzed"] == 30
     assert manifest["stats"]["selected"] > 0
     assert len(manifest["frames"]) == manifest["stats"]["selected"]
-    assert manifest["frames"][0]["reason"] == "time-window"
+    assert manifest["frames"][0]["reason"] == "seed"
 
 
 def test_missing_video_is_user_error(tmp_path):
